@@ -1,0 +1,457 @@
+//@version=5
+indicator("FvgGold - Optimized v2", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ---- Inputs ----
+tf_fvg      = input.timeframe("15", "FVG Timeframe")
+MinGapSize  = input.int(5, "MinGapSize (ticks) - reduce for testing", minval=1)
+MaxAgeBars  = input.int(20, "MaxAgeBars")
+MinAgeBars  = input.int(2, "MinAgeBars")
+FVGBuffer   = input.float(3.0, "FVGBuffer (price units)")
+
+MinScoreFVG     = input.float(30.0, "MinScoreFVG - lower for testing")
+ScoreGapWeight  = input.float(30.0, "ScoreGapWeight")
+ScoreDispWeight = input.float(30.0, "ScoreDispWeight")
+ScoreHTFWeight  = input.float(20.0, "ScoreHTFWeight")
+ScoreFreshWeight= input.float(10.0, "ScoreFreshWeight")
+ScorePDWeight   = input.float(10.0, "ScorePDWeight")
+
+HTF_Period = input.timeframe("60", "HTF for EMA/ATR")
+EMA_Fast   = input.int(50, "EMA_Fast (HTF)")
+EMA_Slow   = input.int(200, "EMA_Slow (HTF)")
+
+ATR_TP_Mult     = input.float(2.0, "ATR_TP_Mult")
+RiskRewardRatio = input.float(2.0, "RiskRewardRatio")
+UseFixedRR      = input.bool(true, "UseFixedRR")
+
+// Mitigation / display options
+MitigateConsec = input.int(1, "Mitigation consecutive closes to confirm", minval=1)
+ShowMitigated  = input.bool(false, "Show mitigated FVGs (faded)")
+
+// Colors
+BuyEdgeColor   = input.color(color.new(color.lime, 0), "Buy Edge Color")
+SellEdgeColor  = input.color(color.new(color.red, 0), "Sell Edge Color")
+BuyMidColor    = input.color(color.new(color.yellow, 0), "Buy Midline Color")
+SellMidColor   = input.color(color.new(color.orange, 0), "Sell Midline Color")
+BuyEntryColor  = input.color(color.new(color.yellow, 0), "Buy Entry Color")
+SellEntryColor = input.color(color.new(color.orange, 0), "Sell Entry Color")
+BuyTPColor     = input.color(color.new(color.green, 0), "Buy TP Color")
+SellTPColor    = input.color(color.new(color.blue, 0), "Sell TP Color")
+BuySLColor     = input.color(color.new(color.red, 0), "Buy SL Color")
+SellSLColor    = input.color(color.new(color.fuchsia, 0), "Sell SL Color")
+
+// Limits
+MAX_FVGS_STORED = input.int(200, "Maximum stored FVGs (safety cap)", minval=50)
+
+// ---- Multi-timeframe series ----
+mintick = syminfo.mintick
+
+high_tf  = request.security(syminfo.tickerid, tf_fvg, high,  lookahead=barmerge.lookahead_off)
+low_tf   = request.security(syminfo.tickerid, tf_fvg, low,   lookahead=barmerge.lookahead_off)
+open_tf  = request.security(syminfo.tickerid, tf_fvg, open,  lookahead=barmerge.lookahead_off)
+close_tf = request.security(syminfo.tickerid, tf_fvg, close, lookahead=barmerge.lookahead_off)
+time_tf  = request.security(syminfo.tickerid, tf_fvg, time,  lookahead=barmerge.lookahead_off)
+atr_tf   = request.security(syminfo.tickerid, tf_fvg, ta.atr(14), lookahead=barmerge.lookahead_off)
+
+ema_fast_htf = request.security(syminfo.tickerid, HTF_Period, ta.ema(close, EMA_Fast), lookahead=barmerge.lookahead_off)
+ema_slow_htf = request.security(syminfo.tickerid, HTF_Period, ta.ema(close, EMA_Slow), lookahead=barmerge.lookahead_off)
+atr_htf      = request.security(syminfo.tickerid, HTF_Period, ta.atr(14), lookahead=barmerge.lookahead_off)
+
+// HTF bias
+get_htf_bias() =>
+    ema_fast_htf > ema_slow_htf ? 1 : ema_fast_htf < ema_slow_htf ? -1 : 0
+
+// TF seconds helper
+tf_to_seconds(tf) =>
+    s = str.upper(tf)
+    s == "D" ? 86400 :
+     s == "W" ? 86400 * 7 :
+     s == "M" ? 86400 * 30 :
+     (na(str.tonumber(s)) ? 60 : str.tonumber(s) * 60)
+tf_fvg_secs = tf_to_seconds(tf_fvg)
+
+// ---- Storage arrays (data + visuals) ----
+var int[]    fvg_time_arr    = array.new_int()
+var float[]  fvg_top_arr     = array.new_float()
+var float[]  fvg_bot_arr     = array.new_float()
+var int[]    fvg_type_arr    = array.new_int()
+var float[]  fvg_score_arr   = array.new_float()
+var bool[]   fvg_mitigated   = array.new_bool()
+var int[]    fvg_mitig_count = array.new_int()
+
+// visuals (line/label arrays keep same index positions as data arrays; entries may be na)
+var line[]   fvg_line_top    = array.new_line()
+var line[]   fvg_line_bot    = array.new_line()
+var line[]   fvg_line_mid    = array.new_line()
+var label[]  fvg_label_arr   = array.new_label()
+
+// Best signal lines / labels (single set) - keep track to delete old
+var line best_le = na
+var line best_ls = na
+var line best_lt = na
+var label best_lab_tp = na
+var label best_lab_entry = na
+var label best_lab_sl = na
+var int lastBestIdx = -1
+
+// ---- Helpers ----
+calc_displacement(idx) =>
+    // idx refers to index in the TF series (n-th historical bar)
+    h = high_tf[idx]
+    l = low_tf[idx]
+    r = h - l
+    r <= 0 ? 0.0 : math.abs(close_tf[idx] - open_tf[idx]) / r
+
+calc_fvg_score(fvgType, gapTop, gapBot, middle_idx, ageBars) =>
+    var float score = 0.0
+    if na(atr_tf) or atr_tf == 0
+        score := 0.0
+    else
+        gapSizeTicks = (gapTop - gapBot) / mintick
+        gapRatio = gapSizeTicks / (atr_tf / mintick)
+        score := score + math.min(gapRatio, 1.0) * ScoreGapWeight
+        score := score + calc_displacement(middle_idx) * ScoreDispWeight
+        bias = get_htf_bias()
+        if fvgType == bias
+            score := score + ScoreHTFWeight
+        freshness = 1.0 - (ageBars / MaxAgeBars)
+        freshness := math.max(0.0, math.min(1.0, freshness))
+        score := score + freshness * ScoreFreshWeight
+        if not na(ema_fast_htf)
+            dist = close - ema_fast_htf
+            if fvgType == 1 and dist < 0
+                score := score + ScorePDWeight
+            else if fvgType == -1 and dist > 0
+                score := score + ScorePDWeight
+    score
+
+exists_fvg_time(t) =>
+    f = false
+    for i = 0 to array.size(fvg_time_arr) - 1
+        if array.get(fvg_time_arr, i) == t
+            f := true
+            break
+    f
+
+// Delete visuals and remove entries at index i from ALL arrays
+remove_fvg_at(i) =>
+    // delete visuals if present
+    if i < array.size(fvg_line_top)
+        ln = array.get(fvg_line_top, i)
+        if not na(ln)
+            line.delete(ln)
+    if i < array.size(fvg_line_bot)
+        ln = array.get(fvg_line_bot, i)
+        if not na(ln)
+            line.delete(ln)
+    if i < array.size(fvg_line_mid)
+        ln = array.get(fvg_line_mid, i)
+        if not na(ln)
+            line.delete(ln)
+    if i < array.size(fvg_label_arr)
+        lb = array.get(fvg_label_arr, i)
+        if not na(lb)
+            label.delete(lb)
+    // remove from all arrays (check bounds)
+    if i < array.size(fvg_time_arr)
+        array.remove(fvg_time_arr, i)
+    if i < array.size(fvg_top_arr)
+        array.remove(fvg_top_arr, i)
+    if i < array.size(fvg_bot_arr)
+        array.remove(fvg_bot_arr, i)
+    if i < array.size(fvg_type_arr)
+        array.remove(fvg_type_arr, i)
+    if i < array.size(fvg_score_arr)
+        array.remove(fvg_score_arr, i)
+    if i < array.size(fvg_mitigated)
+        array.remove(fvg_mitigated, i)
+    if i < array.size(fvg_mitig_count)
+        array.remove(fvg_mitig_count, i)
+    if i < array.size(fvg_line_top)
+        array.remove(fvg_line_top, i)
+    if i < array.size(fvg_line_bot)
+        array.remove(fvg_line_bot, i)
+    if i < array.size(fvg_line_mid)
+        array.remove(fvg_line_mid, i)
+    if i < array.size(fvg_label_arr)
+        array.remove(fvg_label_arr, i)
+
+// ---- Detect FVGs ----
+detect_fvgs() =>
+    maxScan = math.min(MaxAgeBars + 5, 200)
+    for n = 2 to maxScan
+        if na(time_tf[n]) or na(time_tf[n-2])
+            continue
+        bullish = low_tf[n] > high_tf[n-2]
+        bearish = high_tf[n] < low_tf[n-2]
+        if not bullish and not bearish
+            continue
+        fvgType = bullish ? 1 : -1
+        gapTop = bullish ? low_tf[n] : low_tf[n-2]
+        gapBot = bullish ? high_tf[n-2] : low_tf[n]
+        gapSizeTicks = (gapTop - gapBot) / mintick
+        if gapSizeTicks < MinGapSize
+            continue
+        ageBars = n - 1
+        if ageBars < MinAgeBars or ageBars > MaxAgeBars
+            continue
+        t_middle = time_tf[n-1]  // ms timestamp
+        if exists_fvg_time(int(t_middle))
+            continue
+        score = calc_fvg_score(fvgType, gapTop, gapBot, n-1, ageBars)
+        if score < MinScoreFVG
+            continue
+        // push data; keep visuals arrays aligned by pushing na placeholders
+        array.push(fvg_time_arr, int(t_middle))
+        array.push(fvg_top_arr, gapTop)
+        array.push(fvg_bot_arr, gapBot)
+        array.push(fvg_type_arr, fvgType)
+        array.push(fvg_score_arr, score)
+        array.push(fvg_mitigated, false)
+        array.push(fvg_mitig_count, 0)
+        array.push(fvg_line_top, na)
+        array.push(fvg_line_bot, na)
+        array.push(fvg_line_mid, na)
+        array.push(fvg_label_arr, na)
+    // Enforce safety cap: remove oldest if exceed MAX_FVGS_STORED
+    while array.size(fvg_time_arr) > math.max(50, math.min(MAX_FVGS_STORED, 1000))
+        // remove oldest at index 0
+        remove_fvg_at(0)
+    0
+
+// ---- Prune (remove aged) ----
+prune_fvgs(curLastBestIdx) =>
+    lb = curLastBestIdx
+    // if no stored FVGs, clear last best index
+    if array.size(fvg_time_arr) == 0
+        lb := -1
+        lb
+    else
+        now_ms = timenow
+        max_age_ms = MaxAgeBars * tf_fvg_secs * 1000
+        // iterate backwards to avoid index shift issues
+        i = array.size(fvg_time_arr) - 1
+        while i >= 0
+            t = array.get(fvg_time_arr, i)
+            if (now_ms - t) > max_age_ms
+                remove_fvg_at(i)
+                if lb == i
+                    lb := -1
+                else if lb > i
+                    lb := lb - 1
+            i -= 1
+        lb
+
+// ---- Main ----
+if barstate.islastconfirmedhistory or barstate.isrealtime
+    detect_fvgs()
+    lastBestIdx := prune_fvgs(lastBestIdx)
+
+    // ---- Draw/update visuals ----
+    bias = get_htf_bias()
+    bestIdx = -1
+    bestScore = -1.0
+
+    // find best active FVG (matching bias and not mitigated)
+    for i = 0 to array.size(fvg_time_arr) - 1
+        if array.get(fvg_mitigated, i)
+            continue
+        if array.get(fvg_type_arr, i) != bias
+            continue
+        s = array.get(fvg_score_arr, i)
+        if s > bestScore
+            bestScore := s
+            bestIdx := i
+
+    // update each FVG's visual representation and mitigation counters
+    for i = 0 to array.size(fvg_time_arr) - 1
+        tmid = array.get(fvg_time_arr, i)
+        topv = array.get(fvg_top_arr, i)
+        botv = array.get(fvg_bot_arr, i)
+        typ = array.get(fvg_type_arr, i)
+        sc = array.get(fvg_score_arr, i)
+
+        edgeColor = typ == 1 ? BuyEdgeColor : SellEdgeColor
+        midColor = typ == 1 ? BuyMidColor : SellMidColor
+
+        left = tmid
+        right = tmid + int(tf_fvg_secs * 1000 * 2)
+
+        // FIX: Declare variables with explicit types to handle NA
+        var line ltop = na
+        var line lbot = na
+        var line lmid = na
+        var label lab = na
+
+        // create line objects only when placeholder is na; otherwise update coordinates and colors
+        // top line
+        if i >= array.size(fvg_line_top) or na(array.get(fvg_line_top, i))
+            ltop := line.new(x1=left, y1=topv, x2=right, y2=topv, xloc=xloc.bar_time, extend=extend.none)
+            array.set(fvg_line_top, i, ltop)
+        else
+            ltop := array.get(fvg_line_top, i)
+            line.set_xy1(ltop, left, topv)
+            line.set_xy2(ltop, right, topv)
+        
+        // bot line
+        if i >= array.size(fvg_line_bot) or na(array.get(fvg_line_bot, i))
+            lbot := line.new(x1=left, y1=botv, x2=right, y2=botv, xloc=xloc.bar_time, extend=extend.none)
+            array.set(fvg_line_bot, i, lbot)
+        else
+            lbot := array.get(fvg_line_bot, i)
+            line.set_xy1(lbot, left, botv)
+            line.set_xy2(lbot, right, botv)
+        
+        // mid line
+        midprice = (topv + botv) / 2.0
+        if i >= array.size(fvg_line_mid) or na(array.get(fvg_line_mid, i))
+            lmid := line.new(x1=left, y1=midprice, x2=right, y2=midprice, xloc=xloc.bar_time, extend=extend.none)
+            array.set(fvg_line_mid, i, lmid)
+        else
+            lmid := array.get(fvg_line_mid, i)
+            line.set_xy1(lmid, left, midprice)
+            line.set_xy2(lmid, right, midprice)
+
+        // label
+        if i >= array.size(fvg_label_arr) or na(array.get(fvg_label_arr, i))
+            labtxt = "FVG " + (typ == 1 ? "BUY" : "SELL") + " (" + str.tostring(sc, "#.0") + ")"
+            lab := label.new(x=left, y=topv, text=labtxt, xloc=xloc.bar_time, yloc=yloc.price, style=label.style_label_left, textcolor=edgeColor, size=size.tiny)
+            array.set(fvg_label_arr, i, lab)
+        else
+            lab := array.get(fvg_label_arr, i)
+            // update label position/text
+            label.set_xy(lab, left, topv)
+            label.set_text(lab, "FVG " + (typ == 1 ? "BUY" : "SELL") + " (" + str.tostring(sc, "#.0") + ")")
+
+        // style & fade if mitigated
+        if array.get(fvg_mitigated, i)
+            fade = 80
+            if not na(ltop)
+                line.set_color(ltop, color.new(edgeColor, fade))
+            if not na(lbot)
+                line.set_color(lbot, color.new(edgeColor, fade))
+            if not na(lmid)
+                line.set_color(lmid, color.new(midColor, fade))
+            // optionally hide labels
+            if not ShowMitigated
+                if not na(lab)
+                    label.delete(lab)
+                    array.set(fvg_label_arr, i, na)
+        else
+            if not na(ltop)
+                line.set_color(ltop, edgeColor)
+                line.set_width(ltop, 2)
+            if not na(lbot)
+                line.set_color(lbot, edgeColor)
+                line.set_width(lbot, 2)
+            if not na(lmid)
+                line.set_color(lmid, midColor)
+                line.set_width(lmid, 1)
+
+        // mitigation counter: crossing midpoint
+        mit_count = array.get(fvg_mitig_count, i)
+        crossed = (typ == 1 and close < midprice) or (typ == -1 and close > midprice)
+        if crossed
+            mit_count := mit_count + 1
+            array.set(fvg_mitig_count, i, mit_count)
+        else
+            if mit_count != 0
+                array.set(fvg_mitig_count, i, 0)
+
+        if array.get(fvg_mitig_count, i) >= MitigateConsec
+            array.set(fvg_mitigated, i, true)
+
+    // best signal: manage single set of entry/sl/tp lines/labels (delete old when best changes)
+    if lastBestIdx != bestIdx
+        // delete previous best visuals
+        if not na(best_le)
+            line.delete(best_le)
+            best_le := na
+        if not na(best_ls)
+            line.delete(best_ls)
+            best_ls := na
+        if not na(best_lt)
+            line.delete(best_lt)
+            best_lt := na
+        if not na(best_lab_tp)
+            label.delete(best_lab_tp)
+            best_lab_tp := na
+        if not na(best_lab_entry)
+            label.delete(best_lab_entry)
+            best_lab_entry := na
+        if not na(best_lab_sl)
+            label.delete(best_lab_sl)
+            best_lab_sl := na
+        lastBestIdx := bestIdx
+
+    // draw best lines/labels (if any)
+    if bestIdx >= 0 and bestIdx < array.size(fvg_time_arr)
+        topv = array.get(fvg_top_arr, bestIdx)
+        botv = array.get(fvg_bot_arr, bestIdx)
+        typ = array.get(fvg_type_arr, bestIdx)
+        entry = typ == 1 ? botv + FVGBuffer * 0.5 : topv - FVGBuffer * 0.5
+        sl = typ == 1 ? botv - FVGBuffer : topv + FVGBuffer
+        slDist = math.abs(entry - sl)
+        tp = UseFixedRR ? (typ == 1 ? entry + slDist * RiskRewardRatio : entry - slDist * RiskRewardRatio) : (typ == 1 ? entry + atr_tf * ATR_TP_Mult : entry - atr_tf * ATR_TP_Mult)
+
+        // entry
+        if na(best_le)
+            best_le := line.new(x1=bar_index, y1=entry, x2=bar_index+1, y2=entry, xloc=xloc.bar_index, extend=extend.right)
+            line.set_color(best_le, typ == 1 ? BuyEntryColor : SellEntryColor)
+            line.set_style(best_le, line.style_dotted)
+            line.set_width(best_le, 2)
+        else
+            line.set_xy1(best_le, bar_index, entry)
+            line.set_xy2(best_le, bar_index+1, entry)
+        // sl
+        if na(best_ls)
+            best_ls := line.new(x1=bar_index, y1=sl, x2=bar_index+1, y2=sl, xloc=xloc.bar_index, extend=extend.right)
+            line.set_color(best_ls, typ == 1 ? BuySLColor : SellSLColor)
+            line.set_style(best_ls, line.style_solid)
+            line.set_width(best_ls, 2)
+        else
+            line.set_xy1(best_ls, bar_index, sl)
+            line.set_xy2(best_ls, bar_index+1, sl)
+        // tp
+        if na(best_lt)
+            best_lt := line.new(x1=bar_index, y1=tp, x2=bar_index+1, y2=tp, xloc=xloc.bar_index, extend=extend.right)
+            line.set_color(best_lt, typ == 1 ? BuyTPColor : SellTPColor)
+            line.set_style(best_lt, line.style_dashed)
+            line.set_width(best_lt, 2)
+        else
+            line.set_xy1(best_lt, bar_index, tp)
+            line.set_xy2(best_lt, bar_index+1, tp)
+
+        // labels
+        if na(best_lab_tp)
+            best_lab_tp := label.new(x=bar_index, y=tp, text="T/P", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_right, textcolor=(typ==1?BuyTPColor:SellTPColor), size=size.small)
+        else
+            label.set_xy(best_lab_tp, bar_index, tp)
+        if na(best_lab_entry)
+            best_lab_entry := label.new(x=bar_index, y=entry, text="ENTRY", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_right, textcolor=(typ==1?BuyEntryColor:SellEntryColor), size=size.small)
+        else
+            label.set_xy(best_lab_entry, bar_index, entry)
+        if na(best_lab_sl)
+            best_lab_sl := label.new(x=bar_index, y=sl, text="S/L", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_right, textcolor=(typ==1?BuySLColor:SellSLColor), size=size.small)
+        else
+            label.set_xy(best_lab_sl, bar_index, sl)
+
+// ---- Small dashboard ----
+var table tb = table.new(position.top_right, 2, 6, frame_color=color.gray, border_width=1)
+if barstate.islast
+    bias = get_htf_bias()
+    biasStr = bias == 1 ? "BULL" : bias == -1 ? "BEAR" : "NONE"
+    totalFVG = array.size(fvg_time_arr)
+    // safe best score read
+    bestScoreDisplay = (lastBestIdx >= 0 and lastBestIdx < array.size(fvg_score_arr)) ? str.tostring(array.get(fvg_score_arr, lastBestIdx), "#.0") : "N/A"
+    table.cell(tb, 0, 0, "FvgGold - optimized", bgcolor=color.gray, text_color=color.white)
+    table.cell(tb, 1, 0, "Bias: " + biasStr)
+    table.cell(tb, 0, 1, "TF: " + tf_fvg)
+    table.cell(tb, 1, 1, "HTF: " + HTF_Period)
+    table.cell(tb, 0, 2, "ATR(FVG TF):")
+    table.cell(tb, 1, 2, str.tostring(atr_tf, "#.##"))
+    table.cell(tb, 0, 3, "FVGs:")
+    table.cell(tb, 1, 3, str.tostring(totalFVG))
+    table.cell(tb, 0, 4, "Best score:")
+    table.cell(tb, 1, 4, bestScoreDisplay)
+    table.cell(tb, 0, 5, "Now (ms):")
+    table.cell(tb, 1, 5, str.tostring(timenow))
