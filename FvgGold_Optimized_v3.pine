@@ -251,114 +251,116 @@ if barstate.islastconfirmedhistory or barstate.isrealtime
     bestIdx = -1
     bestScore = -1.0
 
-    // find best active FVG (matching bias and not mitigated)
-    for i = 0 to array.size(fvg_time_arr) - 1
-        if array.get(fvg_mitigated, i)
-            continue
-        if array.get(fvg_type_arr, i) != bias
-            continue
-        s = array.get(fvg_score_arr, i)
-        if s > bestScore
-            bestScore := s
-            bestIdx := i
+    // FIX: Check if array has elements before iterating
+    if array.size(fvg_time_arr) > 0
+        // find best active FVG (matching bias and not mitigated)
+        for i = 0 to array.size(fvg_time_arr) - 1
+            if array.get(fvg_mitigated, i)
+                continue
+            if array.get(fvg_type_arr, i) != bias
+                continue
+            s = array.get(fvg_score_arr, i)
+            if s > bestScore
+                bestScore := s
+                bestIdx := i
 
-    // update each FVG's visual representation and mitigation counters
-    for i = 0 to array.size(fvg_time_arr) - 1
-        tmid = array.get(fvg_time_arr, i)
-        topv = array.get(fvg_top_arr, i)
-        botv = array.get(fvg_bot_arr, i)
-        typ = array.get(fvg_type_arr, i)
-        sc = array.get(fvg_score_arr, i)
+        // update each FVG's visual representation and mitigation counters
+        for i = 0 to array.size(fvg_time_arr) - 1
+            tmid = array.get(fvg_time_arr, i)
+            topv = array.get(fvg_top_arr, i)
+            botv = array.get(fvg_bot_arr, i)
+            typ = array.get(fvg_type_arr, i)
+            sc = array.get(fvg_score_arr, i)
 
-        edgeColor = typ == 1 ? BuyEdgeColor : SellEdgeColor
-        midColor = typ == 1 ? BuyMidColor : SellMidColor
+            edgeColor = typ == 1 ? BuyEdgeColor : SellEdgeColor
+            midColor = typ == 1 ? BuyMidColor : SellMidColor
 
-        left = tmid
-        right = tmid + int(tf_fvg_secs * 1000 * 2)
+            left = tmid
+            right = tmid + int(tf_fvg_secs * 1000 * 2)
 
-        // FIX: Declare variables with explicit types to handle NA
-        var line ltop = na
-        var line lbot = na
-        var line lmid = na
-        var label lab = na
+            // FIX: Declare variables with explicit types to handle NA
+            var line ltop = na
+            var line lbot = na
+            var line lmid = na
+            var label lab = na
 
-        // create line objects only when placeholder is na; otherwise update coordinates and colors
-        // top line
-        if i >= array.size(fvg_line_top) or na(array.get(fvg_line_top, i))
-            ltop := line.new(x1=left, y1=topv, x2=right, y2=topv, xloc=xloc.bar_time, extend=extend.none)
-            array.set(fvg_line_top, i, ltop)
-        else
-            ltop := array.get(fvg_line_top, i)
-            line.set_xy1(ltop, left, topv)
-            line.set_xy2(ltop, right, topv)
-        
-        // bot line
-        if i >= array.size(fvg_line_bot) or na(array.get(fvg_line_bot, i))
-            lbot := line.new(x1=left, y1=botv, x2=right, y2=botv, xloc=xloc.bar_time, extend=extend.none)
-            array.set(fvg_line_bot, i, lbot)
-        else
-            lbot := array.get(fvg_line_bot, i)
-            line.set_xy1(lbot, left, botv)
-            line.set_xy2(lbot, right, botv)
-        
-        // mid line
-        midprice = (topv + botv) / 2.0
-        if i >= array.size(fvg_line_mid) or na(array.get(fvg_line_mid, i))
-            lmid := line.new(x1=left, y1=midprice, x2=right, y2=midprice, xloc=xloc.bar_time, extend=extend.none)
-            array.set(fvg_line_mid, i, lmid)
-        else
-            lmid := array.get(fvg_line_mid, i)
-            line.set_xy1(lmid, left, midprice)
-            line.set_xy2(lmid, right, midprice)
+            // create line objects only when placeholder is na; otherwise update coordinates and colors
+            // top line
+            if i >= array.size(fvg_line_top) or na(array.get(fvg_line_top, i))
+                ltop := line.new(x1=left, y1=topv, x2=right, y2=topv, xloc=xloc.bar_time, extend=extend.none)
+                array.set(fvg_line_top, i, ltop)
+            else
+                ltop := array.get(fvg_line_top, i)
+                line.set_xy1(ltop, left, topv)
+                line.set_xy2(ltop, right, topv)
+            
+            // bot line
+            if i >= array.size(fvg_line_bot) or na(array.get(fvg_line_bot, i))
+                lbot := line.new(x1=left, y1=botv, x2=right, y2=botv, xloc=xloc.bar_time, extend=extend.none)
+                array.set(fvg_line_bot, i, lbot)
+            else
+                lbot := array.get(fvg_line_bot, i)
+                line.set_xy1(lbot, left, botv)
+                line.set_xy2(lbot, right, botv)
+            
+            // mid line
+            midprice = (topv + botv) / 2.0
+            if i >= array.size(fvg_line_mid) or na(array.get(fvg_line_mid, i))
+                lmid := line.new(x1=left, y1=midprice, x2=right, y2=midprice, xloc=xloc.bar_time, extend=extend.none)
+                array.set(fvg_line_mid, i, lmid)
+            else
+                lmid := array.get(fvg_line_mid, i)
+                line.set_xy1(lmid, left, midprice)
+                line.set_xy2(lmid, right, midprice)
 
-        // label
-        if i >= array.size(fvg_label_arr) or na(array.get(fvg_label_arr, i))
-            labtxt = "FVG " + (typ == 1 ? "BUY" : "SELL") + " (" + str.tostring(sc, "#.0") + ")"
-            lab := label.new(x=left, y=topv, text=labtxt, xloc=xloc.bar_time, yloc=yloc.price, style=label.style_label_left, textcolor=edgeColor, size=size.tiny)
-            array.set(fvg_label_arr, i, lab)
-        else
-            lab := array.get(fvg_label_arr, i)
-            // update label position/text
-            label.set_xy(lab, left, topv)
-            label.set_text(lab, "FVG " + (typ == 1 ? "BUY" : "SELL") + " (" + str.tostring(sc, "#.0") + ")")
+            // label
+            if i >= array.size(fvg_label_arr) or na(array.get(fvg_label_arr, i))
+                labtxt = "FVG " + (typ == 1 ? "BUY" : "SELL") + " (" + str.tostring(sc, "#.0") + ")"
+                lab := label.new(x=left, y=topv, text=labtxt, xloc=xloc.bar_time, yloc=yloc.price, style=label.style_label_left, textcolor=edgeColor, size=size.tiny)
+                array.set(fvg_label_arr, i, lab)
+            else
+                lab := array.get(fvg_label_arr, i)
+                // update label position/text
+                label.set_xy(lab, left, topv)
+                label.set_text(lab, "FVG " + (typ == 1 ? "BUY" : "SELL") + " (" + str.tostring(sc, "#.0") + ")")
 
-        // style & fade if mitigated
-        if array.get(fvg_mitigated, i)
-            fade = 80
-            if not na(ltop)
-                line.set_color(ltop, color.new(edgeColor, fade))
-            if not na(lbot)
-                line.set_color(lbot, color.new(edgeColor, fade))
-            if not na(lmid)
-                line.set_color(lmid, color.new(midColor, fade))
-            // optionally hide labels
-            if not ShowMitigated
-                if not na(lab)
-                    label.delete(lab)
-                    array.set(fvg_label_arr, i, na)
-        else
-            if not na(ltop)
-                line.set_color(ltop, edgeColor)
-                line.set_width(ltop, 2)
-            if not na(lbot)
-                line.set_color(lbot, edgeColor)
-                line.set_width(lbot, 2)
-            if not na(lmid)
-                line.set_color(lmid, midColor)
-                line.set_width(lmid, 1)
+            // style & fade if mitigated
+            if array.get(fvg_mitigated, i)
+                fade = 80
+                if not na(ltop)
+                    line.set_color(ltop, color.new(edgeColor, fade))
+                if not na(lbot)
+                    line.set_color(lbot, color.new(edgeColor, fade))
+                if not na(lmid)
+                    line.set_color(lmid, color.new(midColor, fade))
+                // optionally hide labels
+                if not ShowMitigated
+                    if not na(lab)
+                        label.delete(lab)
+                        array.set(fvg_label_arr, i, na)
+            else
+                if not na(ltop)
+                    line.set_color(ltop, edgeColor)
+                    line.set_width(ltop, 2)
+                if not na(lbot)
+                    line.set_color(lbot, edgeColor)
+                    line.set_width(lbot, 2)
+                if not na(lmid)
+                    line.set_color(lmid, midColor)
+                    line.set_width(lmid, 1)
 
-        // mitigation counter: crossing midpoint
-        mit_count = array.get(fvg_mitig_count, i)
-        crossed = (typ == 1 and close < midprice) or (typ == -1 and close > midprice)
-        if crossed
-            mit_count := mit_count + 1
-            array.set(fvg_mitig_count, i, mit_count)
-        else
-            if mit_count != 0
-                array.set(fvg_mitig_count, i, 0)
+            // mitigation counter: crossing midpoint
+            mit_count = array.get(fvg_mitig_count, i)
+            crossed = (typ == 1 and close < midprice) or (typ == -1 and close > midprice)
+            if crossed
+                mit_count := mit_count + 1
+                array.set(fvg_mitig_count, i, mit_count)
+            else
+                if mit_count != 0
+                    array.set(fvg_mitig_count, i, 0)
 
-        if array.get(fvg_mitig_count, i) >= MitigateConsec
-            array.set(fvg_mitigated, i, true)
+            if array.get(fvg_mitig_count, i) >= MitigateConsec
+                array.set(fvg_mitigated, i, true)
 
     // best signal: manage single set of entry/sl/tp lines/labels (delete old when best changes)
     if lastBestIdx != bestIdx
